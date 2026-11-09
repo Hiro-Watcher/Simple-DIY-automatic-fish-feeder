@@ -4,12 +4,6 @@
   * @file           : main.c
   * @brief          : Main program body
   ******************************************************************************
-  * @attention/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
   * @attention
   *
   * Copyright (c) 2026 STMicroelectronics.
@@ -23,30 +17,24 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+/* USER CODE BEGIN Header */
+/**
+  * @file           : main.c
+  * @brief          : Main program body - Automatic Fish Feeder (Blue Pill)
+  */
+/* USER CODE END Header */
+
 #include "main.h"
 #include <stdio.h>
 #include <string.h>
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define MKE_M17_ADDR (0x40 << 1) // 7-bit I2C address 0x40 shifted left for STM32 HAL
 /* USER CODE END PD */
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
@@ -55,12 +43,11 @@ uint8_t rx_index = 0;
 char time_string[32];
 uint8_t data_ready = 0;
 uint32_t last_fed_tick = 0; // Cooldown tracking
-const uint32_t COOLDOWN_MS = 600000;
+const uint32_t COOLDOWN_MS = 600000; // 10 minutes rest
 int current_hour = -1;
 int current_minute = -1;
-uint8_t fed_this_minute = 0;
 
-// Feeding Schedule (24-hour format: {Hour, Minute})
+// Feeding Schedule (24-hour format)
 typedef struct {
     int hour;
     int minute;
@@ -68,16 +55,16 @@ typedef struct {
 
 FeedingTime schedule[] = {
     { 8, 0 },   // Morning feed: 08:00 AM
-    { 18, 0 },   // Evening feed: 06:00 PM
-	{ 0, 8 },
-	{ 0, 5 },
-	{ 0, 10 },
-	{ 0, 14 },
-	{ 0, 18 },
-	{ 0, 22 },
-	{ 0, 26 },
-	{ 0, 30 },
-	{ 0, 34 },
+    { 18, 0 },  // Evening feed: 06:00 PM
+    { 0, 8 },   // Test entries
+    { 0, 5 },
+    { 0, 10 },
+    { 0, 14 },
+    { 0, 18 },
+    { 0, 22 },
+    { 0, 26 },
+    { 0, 30 },
+    { 0, 34 },
 };
 int num_feedings = sizeof(schedule) / sizeof(schedule[0]);
 /* USER CODE END PV */
@@ -86,45 +73,46 @@ int num_feedings = sizeof(schedule) / sizeof(schedule[0]);
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_I2C1_Init(void);
+
 /* USER CODE BEGIN PFP */
 void execute_feed_cycle(void);
+void motor_set_speed(uint8_t channel, int8_t speed);
 int time_to_minutes(int hour, int minute);
 uint8_t is_in_window(int current_total_min, int scheduled_hour, int scheduled_min);
 /* USER CODE END PFP */
 
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
-
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
   SystemClock_Config();
+
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_I2C1_Init();
 
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &rx_buffer[rx_index], 1);
   /* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
       if (data_ready) {
           data_ready = 0; // Clear UART flag
 
-          // Parse time string "HH:MM" received from ESP32
-          if (sscanf(time_string, "%d:%d", &current_hour, &current_minute) == 2) {
+          // Parse time string received from ESP32 (handles both "HH:MM" or full timestamps)
+          int parsed = 0;
+          if (strchr(time_string, '-')) {
+              // Full timestamp format: "YYYY-MM-DD HH:MM:SS" -> skip date
+              int year, month, day, sec;
+              parsed = sscanf(time_string, "%d-%d-%d %d:%d:%d", &year, &month, &day, &current_hour, &current_minute, &sec);
+              if (parsed < 5) parsed = 0; else parsed = 2; // We got hour and minute
+          } else {
+              // Short format: "HH:MM"
+              parsed = sscanf(time_string, "%d:%d", &current_hour, &current_minute);
+          }
+
+          if (parsed == 2) {
               int current_total_min = time_to_minutes(current_hour, current_minute);
 
               // Check if 10-minute cooldown since last feed has elapsed
@@ -144,24 +132,17 @@ int main(void)
               }
           }
       }
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
   }
-  /* USER CODE END 3 */
 }
+
 /**
   * @brief System Clock Configuration
-  * @retval None
   */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -171,8 +152,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
@@ -186,21 +165,25 @@ void SystemClock_Config(void)
   }
 }
 
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
+static void MX_I2C1_Init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
 static void MX_USART1_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -213,48 +196,20 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(MOTOR_PIN_GPIO_Port, MOTOR_PIN_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : MOTOR_PIN_Pin */
-  GPIO_InitStruct.Pin = MOTOR_PIN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(MOTOR_PIN_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : HALL_SENSOR_Pin */
+  // Configure Hall Sensor Pin as Input with Pull-Up (PB1)
   GPIO_InitStruct.Pin = HALL_SENSOR_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(HALL_SENSOR_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -265,32 +220,40 @@ int time_to_minutes(int hour, int minute) {
 uint8_t is_in_window(int current_total_min, int scheduled_hour, int scheduled_min) {
     int scheduled_total_min = time_to_minutes(scheduled_hour, scheduled_min);
     int diff = current_total_min - scheduled_total_min;
-
     return (diff >= -10 && diff <= 10);
 }
 
+// Helper to send I2C speed command to MKE-M17 motor driver using defined macro
+void motor_set_speed(uint8_t channel, int8_t speed) {
+    uint8_t data[2] = {channel, (uint8_t)speed};
+    HAL_I2C_Master_Transmit(&hi2c1, MKE_M17_ADDR, data, 2, 100);
+}
+
 void execute_feed_cycle(void) {
-    // 1. Turn ON motor (MOTOR_PIN HIGH)
-    HAL_GPIO_WritePin(MOTOR_PIN_GPIO_Port, MOTOR_PIN_Pin, GPIO_PIN_SET);
+    // 1. Turn ON motor via I2C (Channel 1, Speed = 150)
+    motor_set_speed(1, 150);
 
     uint32_t start_tick = HAL_GetTick();
-    uint32_t timeout_ms = 10000; // 10-second safety timeout to prevent burn-out
+    uint32_t timeout_ms = 10000; // 10-second safety timeout against jams
 
-    // 2. Clearance phase: If starting on magnet, clear sensor for 500ms
+    // 2. Clearance phase: If starting directly on a magnet (LOW), wait until it leaves (HIGH)
     if (HAL_GPIO_ReadPin(HALL_SENSOR_GPIO_Port, HALL_SENSOR_Pin) == GPIO_PIN_RESET) {
-        HAL_Delay(500);
+        while (HAL_GPIO_ReadPin(HALL_SENSOR_GPIO_Port, HALL_SENSOR_Pin) == GPIO_PIN_RESET) {
+            if ((HAL_GetTick() - start_tick) > timeout_ms) break;
+            HAL_Delay(5);
+        }
     }
 
-    // 3. Wait until magnet returns (A3144 pulls pin LOW)
+    // 3. Rotation phase: Wait until the magnet sweeps past and triggers the sensor again (LOW)
     while (HAL_GPIO_ReadPin(HALL_SENSOR_GPIO_Port, HALL_SENSOR_Pin) == GPIO_PIN_SET) {
         if ((HAL_GetTick() - start_tick) > timeout_ms) {
-            break; // Stop motor if chamber jams
+            break; // Stop motor if jammed
         }
-        HAL_Delay(10);
+        HAL_Delay(5);
     }
 
-    // 4. Turn OFF motor immediately (MOTOR_PIN LOW)
-    HAL_GPIO_WritePin(MOTOR_PIN_GPIO_Port, MOTOR_PIN_Pin, GPIO_PIN_RESET);
+    // 4. Turn OFF motor via I2C immediately (Speed = 0)
+    motor_set_speed(1, 0);
 }
 
 // UART Interrupt Callback to capture streaming time data
@@ -303,330 +266,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
         } else {
             rx_index++;
         }
-        // Re-trigger interrupt for the next incoming character
         HAL_UART_Receive_IT(&huart1, &rx_buffer[rx_index], 1);
     }
 }
 /* USER CODE END 4 */
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
-}
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
-
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
-#include "main.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-UART_HandleTypeDef huart1;
-
-/* USER CODE BEGIN PV */
-uint8_t rx_buffer[32];
-uint8_t rx_index = 0;
-char time_string[32];
-uint8_t data_ready = 0;
-
-int current_hour = -1;
-int current_minute = -1;
-uint8_t fed_this_minute = 0;
-
-// Feeding Schedule (24-hour format: {Hour, Minute})
-typedef struct {
-    int hour;
-    int minute;
-} FeedingTime;
-
-FeedingTime schedule[] = {
-    { 8, 0 },   // Morning feed: 08:00 AM
-    { 18, 0 },   // Evening feed: 06:00 PM
-	{ 0, 8 },
-	{ 0, 5 },
-	{ 0, 10 },
-	{ 0, 14 },
-	{ 0, 18 },
-	{ 0, 22 },
-	{ 0, 26 },
-	{ 0, 30 },
-	{ 0, 34 },
-};
-int num_feedings = sizeof(schedule) / sizeof(schedule[0]);
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_USART1_UART_Init(void);
-/* USER CODE BEGIN PFP */
-void execute_feed_cycle(void);
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
-
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_USART1_UART_Init();
-  /* USER CODE BEGIN 2 */
-  // Start receiving UART data byte-by-byte via interrupt
-    HAL_UART_Receive_IT(&huart1, &rx_buffer[rx_index], 1);
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
-}
-
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(MOTOR_PIN_GPIO_Port, MOTOR_PIN_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : MOTOR_PIN_Pin */
-  GPIO_InitStruct.Pin = MOTOR_PIN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(MOTOR_PIN_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : HALL_SENSOR_Pin */
-  GPIO_InitStruct.Pin = HALL_SENSOR_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(HALL_SENSOR_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
-}
-
-/* USER CODE BEGIN 4 */
-void execute_feed_cycle(void) {
-    // Turn on motor transistor (PB0 HIGH)
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
-
-    uint32_t start_tick = HAL_GetTick();
-    uint32_t timeout_ms = 10000; // 10-second safety timeout
-
-    // Wait until A3144 Hall sensor detects magnet (pulls PB1 LOW)
-    while (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_SET) {
-        if ((HAL_GetTick() - start_tick) > timeout_ms) {
-            break; // Prevent infinite loop if motor jams
-        }
-        HAL_Delay(10);
-    }
-
-    // Small clearance buffer delay
-    HAL_Delay(150);
-
-    // Stop motor (PB0 LOW)
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-}
-
-// UART Interrupt Callback to capture streaming time data
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART1) {
-        if (rx_buffer[rx_index] == '\n' || rx_index >= sizeof(time_string) - 1) {
-            time_string[rx_index] = '\0'; // Null-terminate string
-            rx_index = 0;
-            data_ready = 1;
-        } else {
-            rx_index++;
-        }
-        // Re-trigger interrupt for the next incoming character
-        HAL_UART_Receive_IT(&huart1, &rx_buffer[rx_index], 1);
-    }
-}
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+  while (1) {}
 }
 #ifdef USE_FULL_ASSERT
 /**
