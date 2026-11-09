@@ -2,8 +2,8 @@
 #include <time.h>
 
 // Replace with your local Wi-Fi credentials
-const char* ssid     = "Khong Co Ten";
-const char* password = "phamhuong1973";
+const char* ssid     = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
 
 // NTP Server settings
 const char* ntpServer = "pool.ntp.org";
@@ -16,7 +16,7 @@ void setup() {
 
   // Initialize Hardware Serial 2 on ESP32 for board-to-board communication
   // TX2 = GPIO 17, RX2 = GPIO 16 (Connect ESP32 TX2 to Bluepill RX)
-  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);
 
   // Connect to Wi-Fi
   Serial.printf("Connecting to %s ", ssid);
@@ -53,5 +53,5 @@ void loop() {
   }
 
   // Send update to Bluepill once every hour
-  delay(30000); 
+  delay(300000); 
 }
