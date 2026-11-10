@@ -40,6 +40,11 @@ STM32CubeMX, STM32CubeProgrammer, STM32CubeIDE, ArduinoIDE.
 # Process
 I start out with using Archimedes screw as a medium for transport, however I have to abandon it due to it being impossible to create without a 3D printer. then I switch over to gate, which I have to abandon too because it cannot run reliably enough, after a few more hours, I settle on this design that is quite similar to concept use in industrial works, I absolutely did not and never once search up a way to do it through out the project, purely thinking that is all.
 then I just write code and assembling everything.
+## Safety notes
+
+- Never drive the motor directly from Blue Pill pins. Use the motor driver
+  with its own power supply and connect all grounds together.
+- Test with a small amount of food first. Overfeeding pollutes the water.
 # Note
 do remember that you will face trial and error, so buy a lot of spare parts.
 Make sure you don't violate any crucial rules, like don't drive the motor through bluepill
