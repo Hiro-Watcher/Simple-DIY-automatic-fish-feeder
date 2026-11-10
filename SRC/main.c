@@ -61,10 +61,18 @@ FeedingTime schedule[] = {
     { 0, 10 },
     { 0, 14 },
     { 0, 18 },
-    { 0, 22 },
-    { 0, 26 },
-    { 0, 30 },
-    { 0, 34 },
+    { 3, 22 },
+    { 3, 26 },
+    { 3, 30 },
+    { 3, 34 },
+	{ 3, 37 },
+	{ 3, 42 },
+	{ 1, 14 },
+	{ 4, 5 },
+	{ 10, 47 },
+	{ 11, 01 },
+	{ 11, 04 },
+	{ 10, 54 }
 };
 int num_feedings = sizeof(schedule) / sizeof(schedule[0]);
 /* USER CODE END PV */
@@ -185,7 +193,7 @@ static void MX_I2C1_Init(void)
 static void MX_USART1_UART_Init(void)
 {
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 9600; // MATCH ESP32 BAUD RATE
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -226,7 +234,9 @@ uint8_t is_in_window(int current_total_min, int scheduled_hour, int scheduled_mi
 // Helper to send I2C speed command to MKE-M17 motor driver using defined macro
 void motor_set_speed(uint8_t channel, int8_t speed) {
     uint8_t data[2] = {channel, (uint8_t)speed};
-    HAL_I2C_Master_Transmit(&hi2c1, MKE_M17_ADDR, data, 2, 100);
+    if (HAL_I2C_Master_Transmit(&hi2c1, MKE_M17_ADDR, data, 2, 100) != HAL_OK) {
+        // Handle transmission error or log debugging state
+    }
 }
 
 void execute_feed_cycle(void) {
@@ -234,22 +244,20 @@ void execute_feed_cycle(void) {
     motor_set_speed(1, 150);
 
     uint32_t start_tick = HAL_GetTick();
-    uint32_t timeout_ms = 10000; // 10-second safety timeout against jams
+    uint32_t timeout_ms = 10000; // 10-second safety timeout
 
-    // 2. Clearance phase: If starting directly on a magnet (LOW), wait until it leaves (HIGH)
-    if (HAL_GPIO_ReadPin(HALL_SENSOR_GPIO_Port, HALL_SENSOR_Pin) == GPIO_PIN_RESET) {
-        while (HAL_GPIO_ReadPin(HALL_SENSOR_GPIO_Port, HALL_SENSOR_Pin) == GPIO_PIN_RESET) {
-            if ((HAL_GetTick() - start_tick) > timeout_ms) break;
-            HAL_Delay(5);
-        }
+    // 2. Clearance phase: If starting on a magnet (LOW), wait until it leaves (HIGH)
+    while (HAL_GPIO_ReadPin(HALL_SENSOR_GPIO_Port, HALL_SENSOR_Pin) == GPIO_PIN_RESET) {
+        if ((HAL_GetTick() - start_tick) > timeout_ms) break;
+        // NO HAL_Delay here to prevent missing fast edges
     }
 
-    // 3. Rotation phase: Wait until the magnet sweeps past and triggers the sensor again (LOW)
+    // 3. Rotation phase: Wait until the magnet sweeps past and triggers the sensor (LOW)
     while (HAL_GPIO_ReadPin(HALL_SENSOR_GPIO_Port, HALL_SENSOR_Pin) == GPIO_PIN_SET) {
         if ((HAL_GetTick() - start_tick) > timeout_ms) {
             break; // Stop motor if jammed
         }
-        HAL_Delay(5);
+        // NO HAL_Delay here! Continuous polling catches fast magnetic pulses.
     }
 
     // 4. Turn OFF motor via I2C immediately (Speed = 0)
@@ -259,8 +267,14 @@ void execute_feed_cycle(void) {
 // UART Interrupt Callback to capture streaming time data
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
-        if (rx_buffer[rx_index] == '\n' || rx_index >= sizeof(time_string) - 1) {
-            time_string[rx_index] = '\0'; // Null-terminate string
+        if (rx_buffer[rx_index] == '\n' || rx_index >= sizeof(rx_buffer) - 1) {
+            // Null-terminate and strip potential trailing '\r'
+            if (rx_index > 0 && rx_buffer[rx_index - 1] == '\r') {
+                rx_buffer[rx_index - 1] = '\0';
+            } else {
+                rx_buffer[rx_index] = '\0';
+            }
+            strcpy(time_string, (char *)rx_buffer);
             rx_index = 0;
             data_ready = 1;
         } else {
