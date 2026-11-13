@@ -64,7 +64,7 @@ Notes:
 ## Setup
  
 ### Version A
-1. Wire everything as shown in `wiringscheme.png`.
+1. Wire everything as shown in `circuit_image.png`.
 2. In `fetchtime.ino`, set your Wi-Fi SSID and password.
 3. Set `gmtOffset_sec` to your timezone (for example `7 * 3600` for UTC+7).
 4. Edit the feeding times in `main.c`, and remove the test entries.
