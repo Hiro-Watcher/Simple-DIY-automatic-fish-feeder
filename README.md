@@ -40,7 +40,7 @@ About 27 USD for Version A (varies by region). Version B is slightly cheaper bec
 - 5V 2A wall adapter (Version B)
 ## Wiring
  
-**Version A:** wire everything as shown in `wiringscheme.png`.
+**Version A:** wire everything as shown in `circuit_image.png`.
  
 **Version B:**
  
