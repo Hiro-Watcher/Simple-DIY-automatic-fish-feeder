@@ -1,4 +1,4 @@
-/* DESIGNED TO WORK WITHOUT BLUEPILL
+/*
  * Automatic Fish Feeder
  * ESP32-S + MKE-M17 (L9110 I2C motor driver) + A3144 Hall sensor
  *
@@ -39,11 +39,11 @@ const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 const long UTC_OFFSET_SEC = 7L * 3600L;          // Vietnam = UTC+7
 
 struct Slot { uint8_t hour; uint8_t minute; };
-const Slot SLOTS[] = { {8, 0} };                 // up to 15 slots, e.g. {8,0},{18,30}
+const Slot SLOTS[] = { {8, 0}, {10, 52} };                 // up to 15 slots, e.g. {8,0},{18,30}
 const uint32_t WINDOW_SEC = 10UL * 60UL;         // feed allowed from slot time to +10 min
 
 const uint32_t CHECK_INTERVAL_MS    = 5UL * 60UL * 1000UL;        // schedule check period
-const uint32_t MIN_FEED_GAP_S       = 30UL * 60UL;                // 0 = disabled (testing)
+const uint32_t MIN_FEED_GAP_S       = 0;                // 0 = disabled (testing)
 const uint32_t TIME_WAIT_MS         = 30UL * 1000UL;              // wait for NTP after boot
 const uint32_t FALLBACK_INTERVAL_MS = 10UL * 60UL * 60UL * 1000UL; // 10 h when no time
 
@@ -51,11 +51,11 @@ const uint32_t FALLBACK_INTERVAL_MS = 10UL * 60UL * 60UL * 1000UL; // 10 h when 
 const uint8_t  I2C_SDA = 21;
 const uint8_t  I2C_SCL = 22;
 const uint8_t  DRIVER_ADDR = 0x40;
-const uint8_t  MOTOR_PWM = 180;                  // clamped to 150..200 in code
+const uint8_t  MOTOR_PWM = 255;                  // clamped to 150..255 in code
 #define MOTOR_B_FORWARD_IS_CW 1                  // flip to 0 if the blade turns the wrong way
-const uint32_t FEED_TIMEOUT_MS    = 2500;        // ESP32-side hard limit (< 3 s)
-const uint32_t DRIVER_FAILSAFE_MS = 2900;        // driver-side self stop (backup)
-
+const uint32_t FEED_TIMEOUT_MS    = 3500;        // ESP32-side hard limit (< 4 s)
+const uint32_t DRIVER_FAILSAFE_MS = 3900;        // driver-side self stop (backup)
+const uint32_t POST_TRIGGER_RUN_MS = 1000;      //run an extra second for good measure
 // Hall sensor
 const uint8_t  HALL_PIN = 27;                    // no strapping/flash function, has pull-up
 #define SENSOR_POWERED_BY_DRIVER 1               // 1 = via MA1/MA2, 0 = you power it from 3.3V
@@ -66,7 +66,7 @@ const uint32_t TRIGGER_CONFIRM_US   = 1000;      // re-check after a falling edg
 
 // Testing helpers
 #define DEMO_FEED_ON_BOOT 0                      // 1 = run one feed right after boot
-#define CLEAR_FED_RECORD_ON_BOOT 0               // 1 = forget saved "already fed" record
+#define CLEAR_FED_RECORD_ON_BOOT 1               // 1 = forget saved "already fed" record
 // =======================================================================
 
 enum FeedResult { FEED_OK, FEED_TIMEOUT };
@@ -125,7 +125,7 @@ void motorStop() {
 
 // ----------------------------- Feed cycle ------------------------------
 FeedResult runFeedCycle() {
-  const uint8_t pwm = constrain(MOTOR_PWM, 150, 200);
+  const uint8_t pwm = constrain(MOTOR_PWM, 150, 255);
 
   // 1) power the sensor (timed, so no refresh needed) and let it settle
   sensorPowerOn(DRIVER_FAILSAFE_MS + 200);
@@ -146,26 +146,37 @@ FeedResult runFeedCycle() {
   uint32_t t0 = millis();
   motorRun(pwm, DRIVER_FAILSAFE_MS);
 
+  bool extendedRunning = false;
+  uint32_t extendedStart = 0;
+
   while (millis() - t0 < FEED_TIMEOUT_MS) {
-    if (!armed) {
-      // Sampling: wait until the pin has read HIGH (magnet away) for a few ms
-      if (digitalRead(HALL_PIN) == HIGH) {
-        if (!counting) { counting = true; highSince = millis(); }
-        else if (millis() - highSince >= RELEASE_CONFIRM_MS) {
-          armed = true;
-          hallLowEdge = false;   // only edges after this point count
+    if (!extendedRunning) {
+      if (!armed) {
+        // Sampling: wait until the pin has read HIGH (magnet away) for a few ms
+        if (digitalRead(HALL_PIN) == HIGH) {
+          if (!counting) { counting = true; highSince = millis(); }
+          else if (millis() - highSince >= RELEASE_CONFIRM_MS) {
+            armed = true;
+            hallLowEdge = false;   // only edges after this point count
+          }
+        } else {
+          counting = false;
         }
-      } else {
-        counting = false;
+      } else if (hallLowEdge || digitalRead(HALL_PIN) == LOW) {
+        // ISR flag or sampled level says the magnet is back: confirm briefly
+        delayMicroseconds(TRIGGER_CONFIRM_US);
+        if (digitalRead(HALL_PIN) == LOW) {
+          result = FEED_OK;
+          extendedRunning = true;
+          extendedStart = millis(); // Start the 1-second post-trigger timer
+        }
+        hallLowEdge = false;       // glitch, keep going
       }
-    } else if (hallLowEdge || digitalRead(HALL_PIN) == LOW) {
-      // ISR flag or sampled level says the magnet is back: confirm briefly
-      delayMicroseconds(TRIGGER_CONFIRM_US);
-      if (digitalRead(HALL_PIN) == LOW) {
-        result = FEED_OK;
+    } else {
+      // Magnet detected: keep running motor for the extra duration
+      if (millis() - extendedStart >= POST_TRIGGER_RUN_MS) {
         break;
       }
-      hallLowEdge = false;       // glitch, keep going
     }
     delayMicroseconds(100);
   }
@@ -177,7 +188,7 @@ FeedResult runFeedCycle() {
   detachInterrupt(digitalPinToInterrupt(HALL_PIN));
 
   if (result == FEED_OK) {
-    Serial.printf("  Feed OK, one turn in %lu ms\n", (unsigned long)elapsed);
+    Serial.printf("  Feed OK, completed with 1s overrun in %lu ms total\n", (unsigned long)elapsed);
   } else {
     Serial.printf("  FEED FAULT: no magnet return within %lu ms (armed=%d). "
                   "Check jam, magnet polarity, sensor power.\n",
@@ -275,7 +286,7 @@ void setup() {
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(100000);
-  Wire.setTimeOut(50);                       // never hang forever on the I2C bus
+  Wire.setTimeOut(250);                       // never hang forever on the I2C bus
 
   Wire.beginTransmission(DRIVER_ADDR);
   if (Wire.endTransmission() != 0) {
