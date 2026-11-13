@@ -1,0 +1,337 @@
+/* DESIGNED TO WORK WITHOUT BLUEPILL
+ * Automatic Fish Feeder
+ * ESP32-S + MKE-M17 (L9110 I2C motor driver) + A3144 Hall sensor
+ *
+ * WIRING
+ *   ESP32 5V  -> MKE-M17 5V          ESP32 GND -> MKE-M17 GND
+ *   ESP32 GPIO21 (SDA) -> SDA        ESP32 GPIO22 (SCL) -> SCL
+ *   TT motor  -> MB1 (+) / MB2 (-)
+ *   A3144 (+) -> MA1, A3144 (-) -> MA2   (powered by the driver, only while feeding)
+ *   A3144 OUT -> ESP32 GPIO27 (internal pull-up is used)
+ *
+ * HOW IT WORKS
+ *   - Time comes from NTP over Wi-Fi (fixed UTC+7, no DST).
+ *   - Every 5 minutes the schedule is checked. A slot is "due" from its start time
+ *     until start + 10 minutes (forward only, never early).
+ *   - The slot is marked as handled in flash BEFORE the motor starts, so a reset or a
+ *     failed feed can never cause a second feed for the same slot.
+ *   - Missed windows (outage) are skipped. If the ESP32 comes back inside the window,
+ *     it still feeds.
+ *   - No valid time (no Wi-Fi/NTP) -> a 10-hour countdown feeds every 10 hours.
+ *     If real time arrives later, the schedule takes over.
+ *   - Feed cycle: motor starts, waits until the magnet LEAVES the sensor, then stops
+ *     when it comes BACK (one full turn). Hard timeout 2.5 s. The driver also gets a
+ *     timed command, so it stops itself even if the ESP32 hangs.
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Preferences.h>
+#include <time.h>
+#include <MKE_I2C_MotorDriver.h>
+#include "driver/gpio.h"
+
+// ============================ USER SETTINGS ============================
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+const long UTC_OFFSET_SEC = 7L * 3600L;          // Vietnam = UTC+7
+
+struct Slot { uint8_t hour; uint8_t minute; };
+const Slot SLOTS[] = { {8, 0} };                 // up to 15 slots, e.g. {8,0},{18,30}
+const uint32_t WINDOW_SEC = 10UL * 60UL;         // feed allowed from slot time to +10 min
+
+const uint32_t CHECK_INTERVAL_MS    = 5UL * 60UL * 1000UL;        // schedule check period
+const uint32_t MIN_FEED_GAP_S       = 30UL * 60UL;                // 0 = disabled (testing)
+const uint32_t TIME_WAIT_MS         = 30UL * 1000UL;              // wait for NTP after boot
+const uint32_t FALLBACK_INTERVAL_MS = 10UL * 60UL * 60UL * 1000UL; // 10 h when no time
+
+// Motor driver / motor
+const uint8_t  I2C_SDA = 21;
+const uint8_t  I2C_SCL = 22;
+const uint8_t  DRIVER_ADDR = 0x40;
+const uint8_t  MOTOR_PWM = 180;                  // clamped to 150..200 in code
+#define MOTOR_B_FORWARD_IS_CW 1                  // flip to 0 if the blade turns the wrong way
+const uint32_t FEED_TIMEOUT_MS    = 2500;        // ESP32-side hard limit (< 3 s)
+const uint32_t DRIVER_FAILSAFE_MS = 2900;        // driver-side self stop (backup)
+
+// Hall sensor
+const uint8_t  HALL_PIN = 27;                    // no strapping/flash function, has pull-up
+#define SENSOR_POWERED_BY_DRIVER 1               // 1 = via MA1/MA2, 0 = you power it from 3.3V
+#define SENSOR_POWER_USES_CW 1                   // flip to 0 if sensor never responds (polarity)
+const uint32_t SENSOR_SETTLE_MS     = 30;        // sensor power-up time
+const uint32_t RELEASE_CONFIRM_MS   = 3;         // magnet must read "away" this long first
+const uint32_t TRIGGER_CONFIRM_US   = 1000;      // re-check after a falling edge
+
+// Testing helpers
+#define DEMO_FEED_ON_BOOT 0                      // 1 = run one feed right after boot
+#define CLEAR_FED_RECORD_ON_BOOT 0               // 1 = forget saved "already fed" record
+// =======================================================================
+
+enum FeedResult { FEED_OK, FEED_TIMEOUT };
+enum Mode { MODE_WAITING, MODE_SCHEDULE, MODE_FALLBACK };
+
+MKE_I2C_MotorDriver driver;
+Preferences prefs;
+
+volatile bool hallLowEdge = false;
+
+Mode     mode = MODE_WAITING;
+uint32_t bootMs = 0;
+uint32_t nextCheckMs = 0;
+uint32_t fallbackDeadline = 0;
+uint32_t lastWifiTryMs = 0;
+bool     ntpStarted = false;
+
+uint32_t lastKey = 0;        // saved: last slot that was handled
+uint32_t lastEpoch = 0;      // saved: UTC time of that attempt
+uint32_t lastFeedMs = 0;     // this boot only
+bool     fedThisBoot = false;
+
+// ------------------------------ Hall ISR -------------------------------
+void IRAM_ATTR hallISR() {
+  hallLowEdge = true;        // falling edge = magnet arrived
+}
+
+// --------------------------- Driver helpers ----------------------------
+void sensorPowerOn(uint32_t ms) {
+#if SENSOR_POWERED_BY_DRIVER
+  #if SENSOR_POWER_USES_CW
+    driver.motorA_CW(255, ms);       // constant full-on on channel A = steady supply
+  #else
+    driver.motorA_CCW(255, ms);
+  #endif
+#endif
+}
+
+void sensorPowerOff() {
+#if SENSOR_POWERED_BY_DRIVER
+  driver.stopMotorA();
+#endif
+}
+
+void motorRun(uint8_t pwm, uint32_t ms) {
+#if MOTOR_B_FORWARD_IS_CW
+  driver.motorB_CW(pwm, ms);
+#else
+  driver.motorB_CCW(pwm, ms);
+#endif
+}
+
+void motorStop() {
+  driver.stopMotorB();       // stop, no reversing
+}
+
+// ----------------------------- Feed cycle ------------------------------
+FeedResult runFeedCycle() {
+  const uint8_t pwm = constrain(MOTOR_PWM, 150, 200);
+
+  // 1) power the sensor (timed, so no refresh needed) and let it settle
+  sensorPowerOn(DRIVER_FAILSAFE_MS + 200);
+  delay(SENSOR_SETTLE_MS);
+
+  pinMode(HALL_PIN, INPUT_PULLUP);
+  Serial.printf("  Hall idle level: %s\n", digitalRead(HALL_PIN) ? "HIGH (no magnet)" : "LOW (magnet at sensor)");
+
+  hallLowEdge = false;
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
+
+  // 2) go
+  bool armed = false;            // true once the magnet has left the sensor
+  bool counting = false;
+  uint32_t highSince = 0;
+  FeedResult result = FEED_TIMEOUT;
+
+  uint32_t t0 = millis();
+  motorRun(pwm, DRIVER_FAILSAFE_MS);
+
+  while (millis() - t0 < FEED_TIMEOUT_MS) {
+    if (!armed) {
+      // Sampling: wait until the pin has read HIGH (magnet away) for a few ms
+      if (digitalRead(HALL_PIN) == HIGH) {
+        if (!counting) { counting = true; highSince = millis(); }
+        else if (millis() - highSince >= RELEASE_CONFIRM_MS) {
+          armed = true;
+          hallLowEdge = false;   // only edges after this point count
+        }
+      } else {
+        counting = false;
+      }
+    } else if (hallLowEdge || digitalRead(HALL_PIN) == LOW) {
+      // ISR flag or sampled level says the magnet is back: confirm briefly
+      delayMicroseconds(TRIGGER_CONFIRM_US);
+      if (digitalRead(HALL_PIN) == LOW) {
+        result = FEED_OK;
+        break;
+      }
+      hallLowEdge = false;       // glitch, keep going
+    }
+    delayMicroseconds(100);
+  }
+
+  // 3) stop everything (also on timeout)
+  motorStop();
+  uint32_t elapsed = millis() - t0;
+  sensorPowerOff();
+  detachInterrupt(digitalPinToInterrupt(HALL_PIN));
+
+  if (result == FEED_OK) {
+    Serial.printf("  Feed OK, one turn in %lu ms\n", (unsigned long)elapsed);
+  } else {
+    Serial.printf("  FEED FAULT: no magnet return within %lu ms (armed=%d). "
+                  "Check jam, magnet polarity, sensor power.\n",
+                  (unsigned long)elapsed, armed ? 1 : 0);
+  }
+  return result;
+}
+
+void feedNow(const char* reason) {
+  Serial.printf("[feed] %s\n", reason);
+  lastFeedMs = millis();
+  fedThisBoot = true;
+  runFeedCycle();            // no automatic retry; the slot is already marked as handled
+}
+
+// ------------------------------ Scheduling -----------------------------
+bool timeIsValid() {
+  return time(nullptr) > 1700000000L;    // anything after Nov 2023 = NTP has synced
+}
+
+void printLocal(time_t utc) {
+  long s = (((long)utc + UTC_OFFSET_SEC) % 86400L + 86400L) % 86400L;
+  Serial.printf("%02ld:%02ld:%02ld", s / 3600, (s % 3600) / 60, s % 60);
+}
+
+// Returns slot index if "now" is inside a slot's window, else -1.
+// key identifies (day the window started, slot index) and survives midnight.
+int findDueSlot(time_t utc, uint32_t &key) {
+  long local = (long)utc + UTC_OFFSET_SEC;
+  long dayNum = local / 86400L;
+  long secOfDay = local % 86400L;
+  for (size_t i = 0; i < sizeof(SLOTS) / sizeof(SLOTS[0]); i++) {
+    long slotSec = SLOTS[i].hour * 3600L + SLOTS[i].minute * 60L;
+    long diff = (secOfDay - slotSec + 86400L) % 86400L;     // seconds since slot start
+    if (diff <= (long)WINDOW_SEC) {
+      long startDay = (secOfDay >= slotSec) ? dayNum : dayNum - 1;
+      key = (uint32_t)(startDay * 16L + (long)i);
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+bool gapOk(time_t nowUtc) {
+  if (MIN_FEED_GAP_S == 0) return true;
+  if (fedThisBoot && (millis() - lastFeedMs) < MIN_FEED_GAP_S * 1000UL) return false;
+  if (lastEpoch != 0 && (uint32_t)nowUtc >= lastEpoch &&
+      ((uint32_t)nowUtc - lastEpoch) < MIN_FEED_GAP_S) return false;
+  return true;
+}
+
+void scheduledCheck() {
+  time_t now = time(nullptr);
+  Serial.print("[check] local time ");
+  printLocal(now);
+
+  uint32_t key = 0;
+  int idx = findDueSlot(now, key);
+  if (idx < 0) { Serial.println(" - not inside a feeding window"); return; }
+  if (key == lastKey) { Serial.println(" - this slot was already handled"); return; }
+  if (!gapOk(now)) { Serial.println(" - too soon after the previous feed, skipped"); return; }
+
+  Serial.printf(" - slot %d is due\n", idx);
+
+  // Save BEFORE feeding: a reset or a failed feed must not repeat this slot.
+  lastKey = key;
+  lastEpoch = (uint32_t)now;
+  prefs.putUInt("key", lastKey);
+  prefs.putUInt("ep", lastEpoch);
+
+  feedNow("scheduled");
+}
+
+// ------------------------------- Network -------------------------------
+void serviceNetwork(uint32_t now) {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!ntpStarted) {
+      configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+      ntpStarted = true;
+      Serial.println("[net] Wi-Fi connected, NTP started");
+    }
+  } else if (now - lastWifiTryMs >= 30000UL) {
+    lastWifiTryMs = now;
+    Serial.println("[net] Wi-Fi not connected, retrying");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+}
+
+// -------------------------------- Setup --------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== Fish feeder starting ===");
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);                       // never hang forever on the I2C bus
+
+  Wire.beginTransmission(DRIVER_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("WARNING: MKE-M17 not answering at 0x40 (check wiring / address)");
+  }
+  driver.begin(DRIVER_ADDR);
+  driver.stopAll();                          // always start from a known stopped state
+
+  pinMode(HALL_PIN, INPUT_PULLUP);
+
+  prefs.begin("feeder", false);
+#if CLEAR_FED_RECORD_ON_BOOT
+  prefs.clear();
+#endif
+  lastKey = prefs.getUInt("key", 0);
+  lastEpoch = prefs.getUInt("ep", 0);
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  bootMs = millis();
+  lastWifiTryMs = bootMs;
+
+#if DEMO_FEED_ON_BOOT
+  feedNow("demo on boot");
+#endif
+}
+
+// -------------------------------- Loop ---------------------------------
+void loop() {
+  uint32_t now = millis();
+  serviceNetwork(now);
+
+  if (timeIsValid()) {
+    if (mode != MODE_SCHEDULE) {
+      mode = MODE_SCHEDULE;
+      nextCheckMs = now;                     // first check immediately
+      Serial.println("[mode] real time available -> schedule mode");
+    }
+    if ((int32_t)(now - nextCheckMs) >= 0) {
+      nextCheckMs = now + CHECK_INTERVAL_MS;
+      scheduledCheck();
+    }
+  } else if (now - bootMs >= TIME_WAIT_MS) {
+    if (mode != MODE_FALLBACK) {
+      mode = MODE_FALLBACK;
+      fallbackDeadline = now + FALLBACK_INTERVAL_MS;
+      Serial.println("[mode] no time source -> 10 hour countdown started");
+    }
+    if ((int32_t)(now - fallbackDeadline) >= 0) {
+      feedNow("fallback: 10 hour countdown finished");
+      fallbackDeadline = millis() + FALLBACK_INTERVAL_MS;
+    }
+  }
+
+  delay(50);
+}
